@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sucode"
+version = "0.1.0"
+description = "sucode —— 终端 AI 编程助手"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=1.0",
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+sucode = "sucode.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sucode*"]
