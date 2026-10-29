@@ -10,12 +10,39 @@ Agent；历史读写经本对象方法进行（append / pop / history 快照）�
 
 from __future__ import annotations
 
+import random
+from datetime import datetime
+from pathlib import Path
+
 from sucode.config import ProfileConfig
 from sucode.providers import get_provider
 from sucode.providers.base import BaseProvider, Message
 from sucode.tools import ToolRegistry
 
-DEFAULT_PLAN_FILE = "plan.md"  # 计划模式默认计划文件（cwd 下，checklist 承接值）
+# 计划模式 slug 词表（spec(docs/ch04) C63，N28）：24 形容词 + 24 名词，
+# 拼出人眼可读的 plan 文件名，避免 .sucode/plans/ 下多份历史计划无法区分。
+_PLAN_ADJECTIVES = (
+    "amber", "brave", "calm", "dawn", "eager", "flint", "gentle", "harbor",
+    "ivory", "jolly", "keen", "lunar", "mellow", "nimble", "opal", "placid",
+    "quiet", "ruby", "swift", "tidy", "urban", "vivid", "warm", "zesty",
+)
+_PLAN_NOUNS = (
+    "atlas", "beacon", "compass", "delta", "ember", "falcon", "garnet", "harvest",
+    "island", "jungle", "kite", "lantern", "meadow", "nectar", "orbit", "prism",
+    "quarry", "ridge", "sparrow", "temple", "umbra", "vessel", "willow", "zephyr",
+)
+
+
+def make_plan_slug_path() -> Path:
+    """生成一份新的计划文件路径：<cwd>/.sucode/plans/<形容词-名词>-<MMDD-HHMM>.md。
+
+    只生成路径与父目录，不写文件；每次进入计划模式各生成一份（时间戳区分）。
+    """
+    slug = (
+        f"{random.choice(_PLAN_ADJECTIVES)}-{random.choice(_PLAN_NOUNS)}"
+        f"-{datetime.now().strftime('%m%d-%H%M')}"
+    )
+    return Path.cwd() / ".sucode" / "plans" / f"{slug}.md"
 
 
 class ChatSession:
@@ -79,9 +106,18 @@ class ChatSession:
         return self._plan_file
 
     def enter_plan_mode(self, plan_file: str = "") -> None:
-        """/plan [文件]：进入计划模式（唯一放行写目标为计划文件，缺省 plan.md）。"""
+        """/plan [文件]：进入计划模式（唯一放行写目标为计划文件）。
+
+        无参时惰性生成可读 slug 文件（spec(docs/ch04) C63：.sucode/plans/ 下
+        形容词-名词-时间戳命名，父目录自动创建）；带参按用户指定路径（当次会话生效）。
+        """
         self._plan_mode = True
-        self._plan_file = plan_file.strip() or DEFAULT_PLAN_FILE
+        if plan_file.strip():
+            self._plan_file = plan_file.strip()
+        else:
+            path = make_plan_slug_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._plan_file = str(path)
         self._plan_exit_pending = False  # 重新进入计划模式，旧退出标志作废
 
     def exit_plan_mode(self) -> None:

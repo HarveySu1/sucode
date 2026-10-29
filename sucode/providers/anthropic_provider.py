@@ -25,6 +25,7 @@ from sucode.providers.base import (
     ThinkingDelta,
     ToolCallDelta,
     ToolCallStart,
+    UsageUpdate,
     describe_rate_limit,
     serialize_messages,
 )
@@ -90,7 +91,7 @@ class AnthropicProvider(BaseProvider):
         client = self._build_client()
         params: dict = {
             "model": self.profile.model,
-            "max_tokens": self.profile.max_tokens,
+            "max_tokens": self._effective_max_tokens(),  # 运行期覆写优先（ch04 C57）
             "messages": serialize_messages("anthropic", history, has_tools=bool(tools)),
         }
         if system:
@@ -127,6 +128,14 @@ class AnthropicProvider(BaseProvider):
                             )
                     elif event.type == "message_delta" and event.delta.stop_reason:
                         finish_reason = event.delta.stop_reason
+            # 用量上报（ch04 C59）：最终消息携带 usage，StreamDone 之前产出一次
+            final = await stream.get_final_message()
+            usage = getattr(final, "usage", None)
+            if usage is not None:
+                yield UsageUpdate(
+                    input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                    output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                )
             yield StreamDone(finish_reason)
         except anthropic.AnthropicError as exc:
             raise _translate(exc, self.profile) from exc

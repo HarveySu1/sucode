@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from sucode import __version__
 from sucode.config import ConfigError
@@ -47,22 +48,42 @@ def _force_utf8_stdio() -> None:
 
 
 def boot(argv: list[str] | None = None):
-    """解析参数并构建应用实例；配置类失败以 ConfigError 抛出。"""
+    """解析参数并构建应用实例；配置类失败以 ConfigError 抛出。
+
+    参数解析必须先于重型导入（spec(docs/ch03) C54）：`--version` / `--help` 在
+    parse_args 内直接退出，不应为此加载 Provider SDK 与 TUI 栈。
+    """
+    args = build_parser().parse_args(argv)
+
     from sucode.agent import Agent
     from sucode.chat import ChatSession
     from sucode.config import load_config
     from sucode.providers import get_provider
+    from sucode.teams import TeamManager
     from sucode.tools import create_default_registry
+    from sucode.tools.task_create import TaskCreateTool
+    from sucode.tools.task_get import TaskGetTool
+    from sucode.tools.task_list import TaskListTool
+    from sucode.tools.task_update import TaskUpdateTool
     from sucode.tools.tool_search import ToolSearchTool
     from sucode.tui.app import SucodeApp
 
-    args = build_parser().parse_args(argv)
     config = load_config()
     profile = config.get(args.profile)
+    work_dir = Path.cwd()
     tool_registry = create_default_registry()
     tool_registry.register(ToolSearchTool(tool_registry, protocol=profile.protocol))
+    # 团队任务四工具（spec(docs/ch04) C62，T57）：共享任务板默认注册，团队名 default
+    team_manager = TeamManager(work_dir)
+    for tool in (
+        TaskCreateTool(team_manager, "default"),
+        TaskGetTool(team_manager, "default"),
+        TaskListTool(team_manager, "default"),
+        TaskUpdateTool(team_manager, "default"),
+    ):
+        tool_registry.register(tool)
     session = ChatSession(get_provider(profile), tool_registry)
-    agent = Agent(session)  # T36 装配：TUI 只消费 Agent 事件通道
+    agent = Agent(session, work_dir=work_dir)  # ch04 装配：TUI async for 消费 run 生成器
     return SucodeApp(session, agent, config)
 
 

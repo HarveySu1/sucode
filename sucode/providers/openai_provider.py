@@ -25,6 +25,7 @@ from sucode.providers.base import (
     ThinkingDelta,
     ToolCallDelta,
     ToolCallStart,
+    UsageUpdate,
     describe_rate_limit,
     serialize_messages,
 )
@@ -95,14 +96,25 @@ class OpenAIProvider(BaseProvider):
             stream = await client.chat.completions.create(
                 model=self.profile.model,
                 messages=messages,
-                max_tokens=self.profile.max_tokens,
+                max_tokens=self._effective_max_tokens(),  # 运行期覆写优先（ch04 C57）
                 stream=True,
+                stream_options={"include_usage": True},  # 末尾 chunk 带 usage（ch04 C59）
                 **({"tools": tools} if tools else {}),
             )
             finish_reason = ""
+            usage_input = 0
+            usage_output = 0
             tool_states: dict[int, dict] = {}  # index → {id, name, started}
             async with stream:  # 任何退出路径下自动关闭连接
                 async for chunk in stream:
+                    # 用量捕获（ch04 C59，2026-10-30 修订）：usage 落点因端点而异——
+                    # OpenAI 规范为末尾空 choices 的独立 chunk；DeepSeek 实测
+                    # （deepseek-flash）骑在最后一个内容 chunk 上、无独立空 chunk。
+                    # 逐 chunk 探测、非空即记（后到覆盖先到），两种形态通吃。
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        usage_input = int(getattr(usage, "prompt_tokens", 0) or 0)
+                        usage_output = int(getattr(usage, "completion_tokens", 0) or 0)
                     if not chunk.choices:  # 末尾 chunk 可能只带 usage，无 choices
                         continue
                     choice = chunk.choices[0]
@@ -135,6 +147,9 @@ class OpenAIProvider(BaseProvider):
                             yield ToolCallStart(id=st["id"], name=st["name"])
                         if frag:
                             yield ToolCallDelta(id=st["id"], arguments=frag)
+            # 用量上报（ch04 C59）：末尾 usage chunk 汇总，StreamDone 之前产出一次
+            if usage_input or usage_output:
+                yield UsageUpdate(input_tokens=usage_input, output_tokens=usage_output)
             yield StreamDone(finish_reason)
         except openai.OpenAIError as exc:
             raise _translate(exc, self.profile) from exc

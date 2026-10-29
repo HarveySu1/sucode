@@ -37,8 +37,10 @@ DEFAULT_DEFERRED_TOP_K = 3
 # 增量输出回调（spec(docs/ch02) C30）：工具执行中同步调用，不得阻塞；会话层收集后转事件
 Emit = Callable[[str], None]
 
-# 工具分类（spec C35）：静态类型检查，后续权限确认流程按此分级
-Category = Literal["read", "write", "command"]
+# 工具分类（spec C35；ch04 C62 扩展 task）：静态类型检查，权限确认/计划拦截按此分级——
+# write 恒确认、command 白名单外确认、read 与 task 不确认（task = 智能体协作状态，
+# 不改用户文件系统，风险等级同 read，计划模式亦放行）
+Category = Literal["read", "write", "command", "task"]
 
 # 延迟工具检索打分用：抽取英文/数字标识符（工具名与描述以英文标识符为主，中文按整词包含判定）
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")

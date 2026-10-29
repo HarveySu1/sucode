@@ -17,6 +17,11 @@ Phase 3 修订（spec(docs/ch03) C51，2026-10-21）：
 主流程入口见 sucode/cli.py（T10/T36 装配 Agent）。
 Phase 4（/save）：会话历史导出为 markdown 文件——只读 session.history 快照，
 不经工具层（无拦截、无权限确认）；纯导出，不做恢复（ch01 spec O2 仍不做）。
+ch04（spec(docs/ch04) C55/C59/C61，T59）：事件消费由队列改为
+`async for event in agent.run(text)` 生成器直连；块生命周期改惰性创建
+（首个内容事件建块）+ TurnComplete / LoopComplete 双收尾；新增 RetryEvent（↻ 恢复
+提示）、UsageEvent（token 用量暗淡行）、HookEvent（hook 通知行）渲染；权限应答改传
+PermissionResponse 枚举；Esc = request_cancel + worker.cancel（N29 双路径）。
 """
 
 from __future__ import annotations
@@ -33,25 +38,30 @@ from textual.containers import VerticalScroll
 from textual.message import Message
 from textual.widgets import Static, TextArea
 
-from sucode.agent import Agent
+from sucode.agent import (
+    Agent,
+    ErrorEvent,
+    HookEvent,
+    LoopComplete,
+    Notice,
+    PermissionRequest,
+    PermissionResponse,
+    RetryEvent,
+    StreamText,
+    ThinkingText,
+    ToolHeartbeat,
+    ToolOutputDelta,
+    ToolResultEvent,
+    ToolUseEvent,
+    TurnComplete,
+    UsageEvent,
+)
 from sucode.chat import ChatSession
 from sucode.config import AppConfig, ConfigError
 from sucode.providers.base import (
     Message as SessionMessage,  # 会话历史消息（与 textual.message.Message 同名，取别名区分）
-    Notice,
-    PermissionRequest,
-    RoundStart,
-    RunError,
-    RunFinished,
-    StreamEvent,
-    TextDelta,
-    ThinkingDelta,
     ToolCallDelta,
     ToolCallStart,
-    ToolExecuted,
-    ToolHeartbeat,
-    ToolOutputDelta,
-    UserMessage,
 )
 from sucode.tui.widgets import AIMessageView
 
@@ -61,7 +71,7 @@ HELP_TEXT = """\
 /new           清空上下文，重新开始
 /profile       查看当前与可用 profile
 /profile <名>  切换 profile（对话历史保留）
-/plan [文件]   进入计划模式：只读探索，计划写入计划文件（缺省 plan.md）
+/plan [文件]   进入计划模式：只读探索，计划写入计划文件（缺省 .sucode/plans/<可读名>.md）
 /exec          退出计划模式，恢复执行
 /save [文件]   保存当前对话为 markdown（缺省 sucode-session-<时间>.md）
 /help          显示本帮助"""
@@ -225,8 +235,10 @@ class SucodeApp(App[None]):
         self._config = config
         self._current_view = None
         self._streaming = False
-        # 权限确认（C51 修订）：待确认请求（None = 非待确认态）
+        # 权限确认（C51 延续）：待确认请求（None = 非待确认态）
         self._pending_permission: PermissionRequest | None = None
+        # ch04：当前编排 worker 引用（Esc / on_unmount 取消用，替代 agent.task）
+        self._worker = None
 
     def compose(self) -> ComposeResult:
         yield Static(self._topbar_text(), id="topbar")
@@ -240,10 +252,9 @@ class SucodeApp(App[None]):
         self.query_one("#input", InputArea).focus()
 
     def on_unmount(self) -> None:
-        """退出兜底：取消仍在跑的编排后台任务，防事件循环残留。"""
-        task = self._agent.task
-        if task is not None and not task.done():
-            task.cancel()
+        """退出兜底：取消仍在跑的编排 worker，防事件循环残留（N29 硬取消路径）。"""
+        if self._worker is not None and not self._worker.is_finished:
+            self._worker.cancel()
 
     # ---- 顶栏 ----
     def _topbar_text(self) -> str:
@@ -287,9 +298,9 @@ class SucodeApp(App[None]):
             self._append_message("msg-system", "（生成中：先按 Esc 中断再发送新消息）")
             return
         self._append_message("msg-user", f"你：{text}")
-        self._current_view = None  # 由首个 RoundStart 建块（spec(docs/ch02) C32）
+        self._current_view = None  # 由首个内容事件惰性建块（ch04 C55，替代 RoundStart）
         self._streaming = True
-        self._run_stream(self._agent.start(text))
+        self._worker = self._consume(text)
 
     def _handle_command(self, line: str) -> None:
         """执行斜杠命令。"""
@@ -385,8 +396,11 @@ class SucodeApp(App[None]):
         req = self._pending_permission
         assert req is not None
         key = text.strip().lower()
-        verdict = {"y": "allow", "yes": "allow", "n": "deny", "no": "deny",
-                   "a": "always", "always": "always"}.get(key)
+        verdict = {
+            "y": PermissionResponse.ALLOW, "yes": PermissionResponse.ALLOW,
+            "n": PermissionResponse.DENY, "no": PermissionResponse.DENY,
+            "a": PermissionResponse.ALLOW_ALWAYS, "always": PermissionResponse.ALLOW_ALWAYS,
+        }.get(key)
         if verdict is None:
             self._append_message(
                 "msg-system", "请输入 y（允许）/ n（拒绝）/ a（本会话内总是允许）"
@@ -394,19 +408,19 @@ class SucodeApp(App[None]):
             return
         self._pending_permission = None
         self._agent.resolve_permission(req.request_id, verdict)
-        if verdict == "allow":
+        if verdict is PermissionResponse.ALLOW:
             self._append_message("msg-system", "已允许，继续执行。")
-        elif verdict == "always":
+        elif verdict is PermissionResponse.ALLOW_ALWAYS:
             self._append_message("msg-system", f"已允许（本会话内 {req.tool_name} 不再询问）。")
         else:
             self._append_message("msg-system", "已拒绝本次执行。")
 
-    # ---- Esc 中断（C48 双路径）----
+    # ---- Esc 中断（C48 双路径延续 / N29）----
     def action_interrupt(self) -> None:
-        """Esc：取消信号（温和，轮间检查点）+ 后台任务取消（即时）双触发。
+        """Esc：取消信号（温和，轮间检查点）+ worker 取消（即时）双触发。
 
-        worker 不在此处取消——沿通道吃到终止事件后按原因统一收尾
-        （interrupted 标记半截 / cancelled 正常收尾），_streaming 随之复位。
+        worker 即生成器消费者：取消后生成器沿 CancelledError 传播做配对收尾（N18），
+        本协程 except 分支把界面标记「已中断」（LoopComplete 不产出，N29）。
         待确认的权限请求一并取消（C51：Future 悬空无害，N23）。
         """
         if not self._streaming:
@@ -415,48 +429,33 @@ class SucodeApp(App[None]):
             self._pending_permission = None
             self._append_message("msg-system", "已取消待确认的权限请求。")
         self._agent.request_cancel()
-        task = self._agent.task
-        if task is not None and not task.done():
-            task.cancel()
+        if self._worker is not None and not self._worker.is_finished:
+            self._worker.cancel()
 
-    # ---- 通道消费 worker（事件循环内，无线程中转） ----
+    # ---- 事件消费 worker（async for 直连编排生成器，ch04 C55）----
     @work(group="stream")
-    async def _run_stream(self, queue: asyncio.Queue[StreamEvent]) -> None:
-        """消费编排器事件通道：RunFinished 是唯一结束信号（C43）。
+    async def _consume(self, text: str) -> None:
+        """消费编排事件流：async for 直接驱动 agent.run；LoopComplete 后生成器自然终止。
 
-        多轮（spec(docs/ch02) C32）：每个 RoundStart 先收尾上一块再新建一块；
-        StreamDone 不立即收尾（同轮工具反馈随后到达），统一在下一轮开始或终止事件收尾。
-        UserMessage 跳过（本地已渲染）；RunError 暂存，终止时走错误展示。
+        块生命周期（ch04 修订，替代 RoundStart 驱动）：首个内容事件惰性建块；
+        TurnComplete 收尾本轮块、view 置空；LoopComplete 按原因统一收尾
+        （error 配 ErrorEvent 暂存文案）。硬取消（worker.cancel）→ 生成器沿
+        CancelledError 传播做配对收尾（N18/N29），本协程 except 把界面标记中断。
         """
         view: AIMessageView | None = None
         error_text = ""
+
+        def ensure_view() -> AIMessageView:
+            nonlocal view
+            if view is None:
+                view = self._new_ai_message()
+                self._current_view = view
+            return view
+
         try:
-            while True:
-                ev = await queue.get()
-                if isinstance(ev, UserMessage):
-                    continue  # TUI 已自行渲染用户输入
-                if isinstance(ev, RunError):
-                    error_text = ev.message
-                    continue
-                if isinstance(ev, RunFinished):
-                    if view is not None:
-                        if ev.reason == "interrupted":
-                            view.mark_interrupted()
-                        elif error_text:
-                            view.finalize(error_text)
-                        else:
-                            view.finalize()
-                    elif error_text:
-                        self._append_message("msg-error", error_text)
-                    break
-                if isinstance(ev, RoundStart):
-                    if view is not None:
-                        view.finalize()  # 上一轮块收尾
-                    view = self._new_ai_message()
-                    self._current_view = view
-                    continue
+            async for ev in self._agent.run(text):
                 if isinstance(ev, PermissionRequest):
-                    # 待确认态（C51 修订）：醒目提示 + 挂起等输入框应答
+                    # 待确认态（C51 延续）：醒目提示 + 挂起等输入框应答
                     self._pending_permission = ev
                     self._append_message(
                         "msg-permission",
@@ -464,42 +463,65 @@ class SucodeApp(App[None]):
                         "允许吗？输入 y 允许 / n 拒绝 / a 本会话内总是允许（60 秒无应答自动拒绝）",
                     )
                     continue
-                if view is None:  # 防御：首个渲染事件必为 RoundStart
+                if isinstance(ev, RetryEvent):
+                    self._append_message("msg-system", f"↻ {ev.reason}")
                     continue
-                if isinstance(ev, ThinkingDelta):
-                    view.add_thinking(ev.text)
-                elif isinstance(ev, TextDelta):
-                    view.add_text(ev.text)
+                if isinstance(ev, UsageEvent):
+                    self._append_message(
+                        "msg-system",
+                        f"tokens 用量：↑{ev.input_tokens} ↓{ev.output_tokens}"
+                        f"（累计 ↑{ev.total_input} ↓{ev.total_output}）",
+                    )
+                    continue
+                if isinstance(ev, HookEvent):
+                    self._append_message("msg-system", f"[hook:{ev.event}] {ev.message}")
+                    continue
+                if isinstance(ev, ErrorEvent):
+                    error_text = ev.message
+                    continue
+                if isinstance(ev, LoopComplete):
+                    # 自然终止信号（C55）：按原因收尾（硬取消不走这里，N29）
+                    if view is not None:
+                        if ev.reason == "error" and error_text:
+                            view.finalize(error_text)
+                        else:
+                            view.finalize()
+                    elif error_text:
+                        self._append_message("msg-error", error_text)
+                    self._pending_permission = None  # 悬空请求清理（Future 悬空无害，N23）
+                    break  # 生成器已自然终止
+                if isinstance(ev, TurnComplete):
+                    if view is not None:
+                        view.finalize()  # 本轮块收尾
+                    view = None
+                    continue
+                # 内容类事件：惰性建块后分流渲染
+                if isinstance(ev, ThinkingText):
+                    ensure_view().add_thinking(ev.text)
+                elif isinstance(ev, StreamText):
+                    ensure_view().add_text(ev.text)
                 elif isinstance(ev, ToolCallStart):
-                    view.tool_call_started(ev.id, ev.name)
+                    ensure_view().tool_call_started(ev.id, ev.name)
                 elif isinstance(ev, ToolCallDelta):
-                    view.tool_call_delta(ev.id, ev.arguments)
+                    ensure_view().tool_call_delta(ev.id, ev.arguments)
+                elif isinstance(ev, ToolUseEvent):
+                    pass  # 参数已由 Start/Delta 流式呈现；本事件服务 headless 消费者
                 elif isinstance(ev, ToolOutputDelta):
-                    view.tool_output(ev.id, ev.text)
+                    ensure_view().tool_output(ev.id, ev.text)
                 elif isinstance(ev, ToolHeartbeat):
-                    view.tool_heartbeat(ev.id, ev.elapsed)
-                elif isinstance(ev, ToolExecuted):
+                    ensure_view().tool_heartbeat(ev.id, ev.elapsed)
+                elif isinstance(ev, ToolResultEvent):
                     if (
                         self._pending_permission is not None
                         and ev.id == self._pending_permission.request_id
                     ):
                         # 请求已定局（允许后执行完 / 拒绝 / 超时），清理待确认态
                         self._pending_permission = None
-                    view.tool_executed(ev.id, ev.name, ev.ok, ev.preview)
+                    ensure_view().tool_executed(ev.id, ev.name, ev.ok, ev.preview)
                 elif isinstance(ev, Notice):
-                    view.notice(ev.text)
-                # StreamDone：轮次结束标记，不在此收尾（等下一轮或终止事件统一 finalize）
-            # 终止事件已到：等后台任务完全落地再退出，消除下一次 start 的竞态窗口
-            task = self._agent.task
-            if task is not None:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:  # noqa: BLE001 任务内异常已事件化，此处吞掉重复
-                    pass
+                    ensure_view().notice(ev.text)
         except asyncio.CancelledError:
-            # 应用退出等场景 worker 被直接取消：界面标记中断（后台任务由 on_unmount 兜底取消）
+            # 应用退出 / Esc：生成器硬取消路径（N29）——界面标记中断后继续传播
             if view is not None:
                 try:
                     view.mark_interrupted()

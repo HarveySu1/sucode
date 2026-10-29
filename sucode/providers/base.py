@@ -1,8 +1,9 @@
-"""Provider 层抽象：统一流式对话接口与事件集（Phase 1 T3 → Phase 2 T14 扩展）。
+"""Provider 层抽象：统一流式对话接口与事件集（Phase 1 T3 → Phase 2 T14 → ch04 精简扩展）。
 
 接口契约：
 - 输入：完整对话历史（Message 列表）+ 工具列表（可空，双协议格式由注册中心转换）
-- 输出：异步流事件迭代器（见 StreamEvent）
+  + 会话级系统提示词（空串不携带）
+- 输出：异步流事件迭代器（见 StreamEvent，仅 provider 级事件）
 - 失败：网络/鉴权/超上下文等一律转译为 ProviderError 子类抛出
 
 Phase 2 扩展（spec(docs/ch02) C20/C25/N8）：
@@ -11,14 +12,13 @@ Phase 2 扩展（spec(docs/ch02) C20/C25/N8）：
 - serialize_messages 双协议分叉：anthropic 内容块数组（thinking 仅最后工具轮、
   空正文省略 text 块、tool_result 先于正文、空参数归一空对象）；openai tool_calls
   展开 + 带 has_tools 时回传 reasoning_content（DeepSeek 硬性要求）
-- 新事件：SignatureDelta / ToolExecuted / Notice
 
-Phase 2 修订扩展（spec(docs/ch02) C27/C30/C31/C32）：
-- 新事件：RoundStart（轮次开始，TUI 开新块）/ ToolOutputDelta（工具增量输出）/
-  ToolHeartbeat（工具执行心跳，含已用秒数）
-
-Phase 3 修订扩展（spec(docs/ch03) C51，2026-10-21）：
-- 新事件：PermissionRequest（风险操作权限确认请求，应答经同进程 Future 传回）
+ch04 修订（spec(docs/ch04) C55/C57/C59）：
+- 编排层事件（UserMessage/RunError/RunFinished/RoundStart/Notice/ToolExecuted/
+  ToolOutputDelta/ToolHeartbeat/PermissionRequest/FinishReason）全部迁往 sucode/agent.py
+  的 AgentEvent 家族；本文件只保留 provider 级 7 事件
+- UsageUpdate 由「保留不展示」转为正式生产：每流结束产出一次（C59）
+- BaseProvider 增运行期 max_tokens 覆写（set/reset_max_output_tokens，C57 升档用）
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def describe_rate_limit(exc: Exception) -> str:
     return f"触发限流（HTTP 429）：{reason}，稍后重试"
 
 
-# ---- 工具调用结构（Phase 2 启用） ----
+# ---- 工具调用结构 ----
 
 
 @dataclass
@@ -93,7 +93,7 @@ class ToolResultBlock:
     is_error: bool = False
 
 
-# ---- 消息模型（Phase 2 全面启用预留字段） ----
+# ---- 消息模型 ----
 
 
 @dataclass
@@ -108,12 +108,12 @@ class Message:
     tool_results: list[ToolResultBlock] = field(default_factory=list)  # 工具结果（仅 user 消息）
 
 
-# ---- 事件类型 ----
+# ---- provider 级事件类型（编排层 AgentEvent 见 sucode/agent.py，C55） ----
 
 
 @dataclass
 class ThinkingDelta:
-    """思考片段（Anthropic extended thinking；OpenAI 兼容端 reasoning_content，见 spec C6）。"""
+    """思考片段（Anthropic extended thinking；OpenAI 兼容端 reasoning_content）。"""
 
     text: str
 
@@ -140,15 +140,8 @@ class StreamDone:
 
 
 @dataclass
-class MessageStart:
-    """消息开始（保留，当前无生产者）。"""
-
-    role: str = "assistant"
-
-
-@dataclass
 class UsageUpdate:
-    """用量更新（保留；spec O4 不展示）。"""
+    """用量更新（ch04 C59）：每流结束产出一次（input/output tokens）。"""
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -170,106 +163,14 @@ class ToolCallDelta:
     arguments: str = ""
 
 
-@dataclass
-class ToolExecuted:
-    """单个工具执行完成（会话层产出，供 TUI 更新 ✓/✗ 状态行）。"""
-
-    id: str = ""
-    name: str = ""
-    ok: bool = False
-    preview: str = ""
-
-
-@dataclass
-class Notice:
-    """会话层提示（如已达工具轮数上限），TUI 以暗淡行展示。"""
-
-    text: str
-
-
-@dataclass
-class RoundStart:
-    """一轮 LLM 流开始（spec(docs/ch02) C32）：TUI 据此新建一个 AI 消息块。"""
-
-    round: int = 0  # 从 1 起的轮次序号
-
-
-@dataclass
-class ToolOutputDelta:
-    """工具执行中的增量输出片段（spec(docs/ch02) C30，当前仅 Bash 产出）。"""
-
-    id: str = ""
-    text: str = ""
-
-
-@dataclass
-class ToolHeartbeat:
-    """工具执行心跳（spec(docs/ch02) C31）：所有工具执行期间周期性产出，含已用秒数。"""
-
-    id: str = ""
-    name: str = ""
-    elapsed: float = 0.0
-
-
-# ---- 编排层事件（Phase 3 T30，spec(docs/ch03) C43/N19） ----
-
-# 终止原因枚举（checklist 承接值）：正常完成 / 用户中断 / 取消信号 / 错误 / 达轮数上限
-FinishReason = Literal["completed", "interrupted", "cancelled", "error", "max_rounds"]
-
-
-@dataclass
-class UserMessage:
-    """用户消息事件：本轮提问文本（供未来非 TUI 消费者，TUI 已自行渲染）。"""
-
-    text: str
-
-
-@dataclass
-class RunError:
-    """编排错误事件：可读错误文案；后随 RunFinished(reason="error")。"""
-
-    message: str
-
-
-@dataclass
-class RunFinished:
-    """编排终止事件：通道内唯一结束信号（后台任务内一切异常转事件，不跨任务抛）。"""
-
-    reason: FinishReason = "completed"
-
-
-@dataclass
-class PermissionRequest:
-    """权限确认请求（spec(docs/ch03) C51，2026-10-21 修订新增）。
-
-    风险操作（写类 / 白名单外命令）执行前由编排器发出；future 为同进程应答载体——
-    消费者调 Agent.resolve_permission(request_id, verdict) 置结果（N23）。
-    """
-
-    request_id: str
-    tool_name: str
-    summary: str = ""
-    future: asyncio.Future[str] | None = None  # 应答值：allow / deny / always
-
-
 StreamEvent = (
     ThinkingDelta
     | SignatureDelta
     | TextDelta
     | StreamDone
-    | MessageStart
     | UsageUpdate
     | ToolCallStart
     | ToolCallDelta
-    | ToolExecuted
-    | Notice
-    | RoundStart
-    | ToolOutputDelta
-    | ToolHeartbeat
-    | UserMessage
-    | RunError
-    | RunFinished
-    | PermissionRequest
 )
 
 
@@ -387,6 +288,20 @@ class BaseProvider(ABC):
 
     def __init__(self, profile: ProfileConfig) -> None:
         self.profile = profile
+        # 运行期 max_tokens 覆写（ch04 C57 升档用）：None = 用 profile.max_tokens
+        self._max_output_tokens: int | None = None
+
+    def set_max_output_tokens(self, max_tokens: int) -> None:
+        """运行期覆写本次会话的最大输出 token（C57：max_tokens 截断升档）。"""
+        self._max_output_tokens = int(max_tokens)
+
+    def reset_max_output_tokens(self) -> None:
+        """清空运行期覆写（每次编排运行开始时复位，回到 profile 配置值）。"""
+        self._max_output_tokens = None
+
+    def _effective_max_tokens(self) -> int:
+        """生效的最大输出 token：运行期覆写优先，其次 profile 配置。"""
+        return self._max_output_tokens if self._max_output_tokens else self.profile.max_tokens
 
     @abstractmethod
     def stream(
@@ -398,4 +313,6 @@ class BaseProvider(ABC):
         tools 由注册中心按协议转换，每轮原样携带（历史含 tool_use 后必须带）。
         system 为会话级系统提示词（spec(docs/ch03) C50）：空串不携带；
         只进请求体、不进 Message 历史（零污染，N22）。
+        流事件为 provider 级 7 事件；正常结束前产出一次 UsageUpdate（ch04 C59）、
+        末尾产出 StreamDone。
         """
