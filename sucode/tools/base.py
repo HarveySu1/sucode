@@ -7,7 +7,9 @@
 - 结果传递（C36）：ToolResult dataclass，is_error 让模型自行处理失败
 - 注册机制（C37）：ToolRegistry dict 存储，支持 disable / enable 动态管理
 - 文件缓存（C38）：FileCache 线程安全字典，ReadFile 读时填充、EditFile/WriteFile 写后失效
-- 延迟加载（C40）：should_defer 类属性 + 评分搜索（query 与工具名/描述词面重合打分）
+- 工具披露（ch03 C53）：should_defer 类属性声明延迟披露；披露状态与检索由注册中心负责
+  （不再按提问打分自动暴露，改由模型显式调用 ToolSearch 检索后 mark_discovered）
+- 并发判定（ch03 C45）：is_concurrency_safe 为静态类属性，声明式、不读入参
 - execute 成功返回输出文本，失败抛 ToolError；任何失败都转结构化 ToolResult 回传模型，
   CancelledError 不吞——Esc 取消必须能穿透到会话层做配对收尾
 """
@@ -29,7 +31,7 @@ from pydantic import BaseModel, ValidationError
 # 单个工具结果输出上限（spec N6）；超出保留头尾各半并注明
 MAX_OUTPUT_CHARS = 30_000
 
-# 延迟工具按提问打分后最多暴露的数量（spec C40）
+# 延迟工具检索最多返回的数量（C53 承接值）
 DEFAULT_DEFERRED_TOP_K = 3
 
 # 增量输出回调（spec(docs/ch02) C30）：工具执行中同步调用，不得阻塞；会话层收集后转事件
@@ -38,7 +40,7 @@ Emit = Callable[[str], None]
 # 工具分类（spec C35）：静态类型检查，后续权限确认流程按此分级
 Category = Literal["read", "write", "command"]
 
-# 延迟加载打分用：抽取英文/数字标识符（工具名与描述以英文标识符为主，中文按整词包含判定）
+# 延迟工具检索打分用：抽取英文/数字标识符（工具名与描述以英文标识符为主，中文按整词包含判定）
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
@@ -95,16 +97,26 @@ def truncate_output(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
 
 
 def relevance_score(tool: "Tool", query: str) -> int:
-    """延迟工具的提问相关度打分（spec C40）：提问词与「工具名 + 描述」的词面重合数。
+    """延迟工具检索打分（spec(docs/ch03) C53）：名中 +10 / 描述中 +5 / 分词 +3/+1。
 
-    工具名整体出现在提问中额外加权；中文以整词包含判定（不引第三方分词）。
+    检索词整体命中工具名 +10、命中描述 +5；分词（英文/数字标识符）命中名字 +3、
+    命中描述 +1。中文无分词器，靠整体命中描述判定。
     """
-    q = (query or "").lower()
-    hay = f"{tool.name} {tool.description}".lower()
-    tokens = {t for t in _TOKEN_RE.findall(q) if len(t) >= 2}
-    score = sum(1 for t in tokens if t in hay)
-    if tool.name and tool.name.lower() in q:
-        score += 3
+    q = (query or "").strip().lower()
+    if not q:
+        return 0
+    name = tool.name.lower()
+    desc = tool.description.lower()
+    score = 0
+    if q in name:
+        score += 10
+    if q in desc:
+        score += 5
+    for token in {t for t in _TOKEN_RE.findall(q) if len(t) >= 2}:
+        if token in name:
+            score += 3
+        elif token in desc:
+            score += 1
     return score
 
 
@@ -114,22 +126,14 @@ class Tool(ABC):
     name: str = ""
     description: str = ""  # 写给模型看：这个工具做什么、什么时候用
     category: Category = "read"  # 工具分类（spec C35）
-    should_defer: bool = False  # 延迟加载标记：True 则按提问打分后才暴露（spec C40）
+    should_defer: bool = False  # 延迟披露标记：True 则须经 ToolSearch 披露后才出现在工具列表（ch03 C53）
+    is_concurrency_safe: bool = False  # 能否并发执行（ch03 C45）：静态声明，不读入参；默认串行
     timeout: float = 60.0  # execute 硬超时（Bash 按自身 timeout_seconds 调大）
     Params: type[BaseModel] | None = None  # 参数模型；Schema 由其自动生成（spec C34）
 
     @abstractmethod
     async def execute(self, **kwargs) -> str:
         """执行并返回给模型的输出文本；失败抛 ToolError（由统一包装转结构化结果）。"""
-
-    def is_concurrency_safe(self, arguments: dict) -> bool:
-        """按调用入参判定本次调用能否与其他工具并发执行（spec(docs/ch03) C45）。
-
-        默认不安全（宁串行勿并发）：WriteFile / EditFile 等写类不覆写即恒串行；
-        纯读工具覆写恒 True；命令类工具按只读白名单动态判定（见 bash_tool）。
-        arguments 为解析校验后的参数字典（parse_arguments 产物）。
-        """
-        return False
 
     async def execute_streaming(self, emit: Emit | None, **kwargs) -> str:
         """可选流式执行入口（spec(docs/ch02) C30）。

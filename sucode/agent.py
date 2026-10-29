@@ -9,9 +9,9 @@ Phase 3（spec(docs/ch03) C42-C45）把 ReAct 循环从 ChatSession 迁出为独
 - 历史读写全部经 ChatSession（会话层退化为历史 / profile / 模式状态容器，C42）
 
 工具分批执行（C44/C45，N16/N18/N21）：
-- 切批算法：遍历同轮调用序列，经注册中心查工具做按入参的并发安全判定；
-  安全且上一批也是安全批则并入，否则新开批 → 相邻安全调用合并、不安全各自成批、
-  未知工具判不安全（走串行路径在执行时返回结构化错误）
+- 切批算法：遍历同轮调用序列，经注册中心查工具读静态 is_concurrency_safe 类属性
+  （不读入参）；安全且上一批也是安全批则并入，否则新开批 → 相邻安全调用合并、
+  不安全各自成批、未知工具判不安全（走串行路径在执行时返回结构化错误）
 - 安全批 asyncio.gather + 信号量限并发（CONCURRENCY_LIMIT）；批间按原顺序串行
 - 每批全部完成后统一配对入史；中断时已完成保留真实结果、被取消与未开始的
   全部配对「[已中断]」结果（零孤儿）
@@ -28,6 +28,10 @@ Phase 3 修订（spec(docs/ch03) C51/C52，2026-10-21）：
   授权集放行后续同工具调用；超时按拒绝；计划模式不走确认（自动拦截照旧）
 - 记忆提取：终止事件统一出口做运行计数，每 5 次触发后台提取任务（历史快照 →
   LLM 总结 → 追加写入 cwd 的 project_memory.md；fire-and-forget，失败静默）
+
+Phase 3 修订（spec(docs/ch03) C53，2026-10-24）：
+- 工具披露：未披露的 deferred 工具名拼进系统提示词，模型经 ToolSearch 检索披露后，
+  下一轮工具列表才出现该工具（披露状态在注册中心，仅运行期）
 """
 
 from __future__ import annotations
@@ -247,11 +251,31 @@ class Agent:
     # ---- 系统提示词装配（C50）与计划模式（C47）----
 
     def _system_prompt(self) -> str:
-        """按会话模式装配系统提示词：普通最小文案 / 计划模式专用文案。"""
+        """按会话模式装配系统提示词：普通最小文案 / 计划模式专用文案（C50）。
+
+        末尾追加未披露 deferred 工具名单（C53），供模型知道可经 ToolSearch 检索什么。
+        """
         session = self._session
         if not session.plan_mode:
-            return NORMAL_SYSTEM_PROMPT
-        return PLAN_SYSTEM_PROMPT_TEMPLATE.format(plan_file_path=session.plan_file)
+            prompt = NORMAL_SYSTEM_PROMPT
+        else:
+            prompt = PLAN_SYSTEM_PROMPT_TEMPLATE.format(plan_file_path=session.plan_file)
+        return prompt + self._deferred_hint()
+
+    def _deferred_hint(self) -> str:
+        """未披露的延迟工具名单（C53）；无延迟工具时返回空串（零噪音）。"""
+        registry = self._session.registry
+        if registry is None:
+            return ""
+        names = registry.get_deferred_tool_names()
+        if not names:
+            return ""
+        return (
+            "\n\n可用 ToolSearch 检索的延迟工具："
+            + "、".join(names)
+            + "。需要时调用 ToolSearch 获取定义（query 传 select:名称1,名称2 或关键词检索），"
+            "命中后下一轮即可直接调用。"
+        )
 
     async def _plan_intercept(self, tc: ToolCall) -> ToolResult | None:
         """计划模式内置前置钩子（C47/N20）：非计划文件的写类与非白名单命令一律拦截。
@@ -335,7 +359,7 @@ class Agent:
                 out(RoundStart(round=round_index))
 
                 current = _RoundAggregator()
-                async for ev in self._consume_round(current, offer_tools, text):
+                async for ev in self._consume_round(current, offer_tools):
                     out(ev)
                 current.finalize_arguments()
 
@@ -404,17 +428,11 @@ class Agent:
     # ---- 工具轮执行（分批，spec(docs/ch03) C44/C45） ----
 
     def _is_safe_call(self, tc: ToolCall) -> bool:
-        """单次调用是否并发安全：未知工具 / 参数解析失败 / 判定方法说不安全 → False。"""
+        """单次调用是否并发安全：读工具静态类属性；未知工具判不安全。"""
         registry = self._session.registry
         assert registry is not None
         tool = registry.find(tc.name)
-        if tool is None:
-            return False  # 未知工具：串行路径，执行时返回结构化「未知工具」错误
-        try:
-            args = parse_arguments(tool, tc.arguments)
-        except ToolError:
-            return False  # 坏参数：串行路径，执行时返回结构化校验错误
-        return tool.is_concurrency_safe(args)
+        return tool is not None and tool.is_concurrency_safe
 
     def _plan_batches(self, tool_calls: list[ToolCall]) -> list[tuple[bool, list[int]]]:
         """切批（需求方伪代码）：安全且上一批也是安全批则并入，否则新开批。
@@ -594,14 +612,14 @@ class Agent:
     # ---- 轮次消费与收尾 ----
 
     async def _consume_round(
-        self, agg: _RoundAggregator, offer_tools: bool, query: str = ""
+        self, agg: _RoundAggregator, offer_tools: bool
     ) -> AsyncIterator[StreamEvent]:
         """消费一轮 provider 流：透传事件给通道，同时喂给聚合器；确保 aclose。
 
         offer_tools=False 时不携带工具定义（达上限后强制模型只能产出正文）；
-        query 供延迟工具打分（spec C40）；system 按会话模式装配（C50，不进历史）。
+        system 按会话模式装配并附未披露 deferred 名单（C50/C53，不进历史）。
         """
-        tools = self._tool_schemas(query) if offer_tools else None
+        tools = self._tool_schemas() if offer_tools else None
         stream = self._session.provider.stream(
             list(self._session.history), tools, self._system_prompt()
         )
@@ -612,15 +630,15 @@ class Agent:
         finally:
             await stream.aclose()  # 确定性关闭底层流（幂等）
 
-    def _tool_schemas(self, query: str = "") -> list[dict] | None:
+    def _tool_schemas(self) -> list[dict] | None:
         """当前协议的工具列表；无注册中心（纯对话回归）时为 None。
 
-        query 传入当前提问，供注册中心对延迟工具打分择优暴露（spec C40）。
+        延迟工具由注册中心按披露状态过滤（ch03 C53），本层不再传提问。
         """
         registry = self._session.registry
         if registry is None:
             return None
-        return registry.get_all_schemas(self._session.provider.profile.protocol, query=query)
+        return registry.get_all_schemas(self._session.provider.profile.protocol)
 
     def _finalize_interrupted(self, agg: _RoundAggregator | None, round_index: int) -> None:
         """流中断 / 出错收尾（spec(docs/ch02) C29）：

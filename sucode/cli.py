@@ -53,12 +53,15 @@ def boot(argv: list[str] | None = None):
     from sucode.config import load_config
     from sucode.providers import get_provider
     from sucode.tools import create_default_registry
+    from sucode.tools.tool_search import ToolSearchTool
     from sucode.tui.app import SucodeApp
 
     args = build_parser().parse_args(argv)
     config = load_config()
     profile = config.get(args.profile)
-    session = ChatSession(get_provider(profile), create_default_registry())
+    tool_registry = create_default_registry()
+    tool_registry.register(ToolSearchTool(tool_registry, protocol=profile.protocol))
+    session = ChatSession(get_provider(profile), tool_registry)
     agent = Agent(session)  # T36 装配：TUI 只消费 Agent 事件通道
     return SucodeApp(session, agent, config)
 

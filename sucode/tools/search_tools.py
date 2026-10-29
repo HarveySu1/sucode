@@ -65,10 +65,8 @@ class Glob(Tool):
         "查找文件内容请改用 Grep。"
     )
     category = "read"
+    is_concurrency_safe = True  # 纯读恒安全（spec(docs/ch03) C45 静态属性）
     Params = _GlobParams
-
-    def is_concurrency_safe(self, arguments: dict) -> bool:
-        return True  # 纯读恒安全（spec(docs/ch03) C45）
 
     async def execute(self, pattern: str = "", path: str = ".") -> str:
         if not pattern:
@@ -106,10 +104,8 @@ class Grep(Tool):
         "适合「哪里的代码定义/引用了 X」的场景；找文件路径请改用 Glob。"
     )
     category = "read"
+    is_concurrency_safe = True  # 纯读恒安全（spec(docs/ch03) C45 静态属性）
     Params = _GrepParams
-
-    def is_concurrency_safe(self, arguments: dict) -> bool:
-        return True  # 纯读恒安全（spec(docs/ch03) C45）
 
     async def execute(self, pattern: str = "", path: str = ".", glob: str = "") -> str:
         if not pattern:

@@ -44,10 +44,8 @@ class ReadFile(Tool):
         "适合查看源码、配置等任何文本文件。"
     )
     category = "read"
+    is_concurrency_safe = True  # 纯读恒安全（spec(docs/ch03) C45 静态属性）
     Params = _ReadFileParams
-
-    def is_concurrency_safe(self, arguments: dict) -> bool:
-        return True  # 纯读恒安全（spec(docs/ch03) C45）
 
     async def execute(self, path: str = "", offset: int = 0, limit: int = DEFAULT_READ_LINES) -> str:
         file = _resolve(path)

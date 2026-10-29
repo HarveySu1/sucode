@@ -4,7 +4,8 @@
 - 注册机制（C37）：dict 存储，支持 disable / enable 动态管理（禁用工具既不出现在
   给模型的工具列表里，也不可执行）
 - 协议适配（C41）：get_all_schemas(protocol) 按参数区分 Anthropic / OpenAI 格式
-- 延迟加载（C40）：should_defer 的工具按当前提问打分后择优暴露（默认六工具均不延迟）
+- 工具披露（ch03 C53）：should_defer 的工具默认不出现在工具列表，须经 ToolSearch
+  检索后 mark_discovered 才披露；披露状态仅运行期（O23）
 - 统一执行入口 run()：任何失败路径都转结构化 ToolResult，永不抛出除取消外的异常
 """
 
@@ -28,6 +29,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
         self._disabled: set[str] = set()
+        self._discovered: set[str] = set()  # 已披露的延迟工具（ch03 C53，运行期状态）
 
     def register(self, tool: Tool) -> None:
         if not tool.name:
@@ -72,22 +74,64 @@ class ToolRegistry:
     def names(self, include_disabled: bool = False) -> list[str]:
         return sorted(n for n in self._tools if include_disabled or n not in self._disabled)
 
+    # ---- 工具披露（spec(docs/ch03) C53）----
+
+    def mark_discovered(self, name: str) -> None:
+        """标记延迟工具已披露：下一轮 get_all_schemas 起进入工具列表（仅运行期）。"""
+        if name not in self._tools:
+            raise ToolError(f"未知工具「{name}」，无法披露")
+        self._discovered.add(name)
+
+    def is_discovered(self, name: str) -> bool:
+        return name in self._discovered
+
+    def get_deferred_tool_names(self, include_discovered: bool = False) -> list[str]:
+        """可披露的延迟工具名（默认只返回尚未披露的），供系统提示词告知可检索范围。"""
+        return sorted(
+            n
+            for n, t in self._tools.items()
+            if t.should_defer
+            and n not in self._disabled
+            and (include_discovered or n not in self._discovered)
+        )
+
+    def find_deferred_by_names(self, names: list[str]) -> list[Tool]:
+        """按名精确选取延迟工具（对应 ToolSearch 的 select:Name1,Name2 形态）。"""
+        found: list[Tool] = []
+        for name in names:
+            tool = self.find(name)
+            if tool is not None and tool.should_defer:
+                found.append(tool)
+        return found
+
+    def search_deferred(
+        self, query: str, max_results: int = DEFAULT_DEFERRED_TOP_K
+    ) -> list[Tool]:
+        """按打分规则检索延迟工具，取前 max_results 个命中项（C53 承接值）。"""
+        pool = [
+            t for t in self._tools.values() if t.should_defer and t.name not in self._disabled
+        ]
+        scored = sorted(
+            ((relevance_score(t, query), t) for t in pool),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        return [t for score, t in scored if score > 0][: max(0, max_results)]
+
     # ---- 双协议 API 工具列表格式适配（spec C41）----
 
-    def get_all_schemas(
-        self,
-        protocol: str,
-        query: str = "",
-        top_k: int = DEFAULT_DEFERRED_TOP_K,
-    ) -> list[dict]:
+    def get_all_schemas(self, protocol: str) -> list[dict]:
         """按当前 profile 协议给出工具列表（会话层每轮原样携带）。
 
-        - query：当前提问，用于延迟工具打分（spec C40）
-        - 被禁用的工具不出现；should_defer 的工具按打分择优保留
+        被禁用的工具不出现；延迟工具在披露前不出现（ch03 C53，不按提问打分自动暴露）。
         """
         if protocol not in ("anthropic", "openai"):
             raise ToolError(f"未知协议：{protocol}")
-        tools = self._select_tools(query, top_k)
+        tools = [
+            t
+            for t in self._tools.values()
+            if t.name not in self._disabled and (not t.should_defer or t.name in self._discovered)
+        ]
         if protocol == "anthropic":
             return [
                 {"name": t.name, "description": t.description, "input_schema": t.get_schema()}
@@ -100,20 +144,6 @@ class ToolRegistry:
             }
             for t in tools
         ]
-
-    def _select_tools(self, query: str, top_k: int) -> list[Tool]:
-        """可用工具选择：非延迟工具全给；延迟工具按提问打分取前 top_k（spec C40）。"""
-        enabled = [t for t in self._tools.values() if t.name not in self._disabled]
-        eager = [t for t in enabled if not t.should_defer]
-        deferred = [t for t in enabled if t.should_defer]
-        if not deferred:
-            return eager
-        scored = sorted(
-            ((relevance_score(t, query), t) for t in deferred),
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-        return eager + [t for score, t in scored[:top_k] if score > 0]
 
     # ---- 统一执行入口 ----
 
@@ -134,10 +164,10 @@ class ToolRegistry:
 
 
 def create_default_registry() -> ToolRegistry:
-    """六件套默认注册（spec C17）。"""
+    """六件套默认注册（spec C17）；ToolSearch 由 cli 装配时按协议追加（C53/T46）。"""
+    from sucode.tools.bash_tool import Bash
     from sucode.tools.file_tools import EditFile, ReadFile, WriteFile
     from sucode.tools.search_tools import Glob, Grep
-    from sucode.tools.bash_tool import Bash
 
     registry = ToolRegistry()
     for tool in (ReadFile(), WriteFile(), EditFile(), Glob(), Grep(), Bash()):

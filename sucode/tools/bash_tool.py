@@ -57,22 +57,23 @@ def _strip_clixml(text: str) -> str:
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 
-# 只读命令白名单（spec(docs/ch03) C46）：并发安全判定与计划模式拦截两处共享。
+# 只读命令白名单（spec(docs/ch03) C46 修订）：服务计划模式命令拦截与权限确认范围，
+# 不参与并发判定（C45 改静态属性后 Bash 一律串行）。
 # 命令首部命中（单 token 命令或 git 双 token 子命令）且不含元字符才判只读。
 READONLY_BASH_COMMANDS = (
     "ls", "dir", "Get-ChildItem", "cat", "type", "Get-Content",
     "pwd", "Get-Location", "tree", "where",
     "git status", "git diff", "git log", "git show", "git branch",
 )
-# 出现即不安全/拦截的 shell 元字符（管道/顺序分隔/重定向/后台）
+# 出现即拦截的 shell 元字符（管道/顺序分隔/重定向/后台）
 BASH_META_CHARS = "|;><&"
 
 
 def is_readonly_command(command: str) -> bool:
-    """命令是否属于只读白名单：首部命令命中且不含 shell 元字符（C45/C46）。
+    """命令是否属于只读白名单：首部命令命中且不含 shell 元字符（C46）。
 
-    大小写不敏感（PowerShell 命令名大小写无关）；空命令不安全；
-    元字符出现在任何位置（含引号内）都判不安全——组合命令默认不安全（spec L6）。
+    大小写不敏感（PowerShell 命令名大小写无关）；空命令不算只读；
+    元字符出现在任何位置（含引号内）都判不命中——组合命令默认不命中（spec L6）。
     """
     text = str(command or "").strip()
     if not text:
@@ -150,10 +151,6 @@ class Bash(Tool):
     category = "command"
     Params = _BashParams
     timeout = MAX_TIMEOUT + 5.0  # execute 硬超时兜底：比最大可调超时再宽 5s
-
-    def is_concurrency_safe(self, arguments: dict) -> bool:
-        """只读白名单命令且不含元字符才可并发（spec(docs/ch03) C45/C46）。"""
-        return is_readonly_command(str(arguments.get("command", "")))
 
     async def execute(self, command: str = "", timeout_seconds: int = 0) -> str:
         """非流式执行：等价于不回调 emit 的流式执行（保留统一接口的抽象方法实现）。"""
