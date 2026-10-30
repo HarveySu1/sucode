@@ -1,5 +1,7 @@
 # ch03: Agent 编排器与执行策略 Spec
 
+> **【已归档 · 勿作现行依据】** 本章架构于 2026-10-30 被 ch04 取代：`asyncio.Queue` 事件通道改为异步生成器 `async for event in agent.run(text)`（ch04 C55）；`RunFinished` 不再是唯一结束信号；`StreamEvent` 由 12 类编排事件精简为 7 类 provider 事件（ch04 T50）；`DEFAULT_PLAN_FILE` 换为 slug 命名（ch04 C63）。本文正文保留 ch03 当时原貌，**文中行号锚点与已退役符号名全部失效**；现行规格见 [ch04/spec.md](../ch04/spec.md)。
+>
 > 2026-10-20 初版；2026-10-21 修订新增 C51/C52；2026-10-24 重构：C45 并发判定由「按入参动态判定」改为静态类属性（对齐 mewcode），新增 C53 工具披露（deferred + ToolSearch），C46 白名单用途随之收窄。编号沿用跨章连续（C/N/O/T 续 ch02），不随本章重起。2026-10-29 新增 C54（启动路径惰性化）。
 
 ## 1. 背景

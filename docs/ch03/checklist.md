@@ -1,5 +1,7 @@
 # ch03: Agent 编排器与执行策略 Checklist
 
+> **【已归档 · 勿作现行依据】** 本章验收结论在 2026-10-30 被 ch04 覆盖：编排器从 `asyncio.Queue` 通道改为异步生成器，`RunFinished` 唯一结束信号退役，`StreamEvent` 精简为 7 类，plan 文件改为 slug 命名。下列勾选反映 ch03 当时的验收事实，**其中的行号锚点与命令断言已不适用于当前代码**；现行验收见 [ch04/checklist.md](../ch04/checklist.md)。
+>
 > 所有条目必须可勾选、可观测。验收方式写在每项后面的括号里（Windows 终端用 `findstr /n` 实测；计数断言用 PowerShell `(Select-String ...).Count`）。
 > 行号锚点：全部为 2026-10-24 T44-T46 落地后的实测值。
 > 执行记录：2026-10-20 mock 层 236 pass / 0 fail + 真实 API 三场景 14 pass / 0 fail（脚本在 Temp\sucode_verify\ 不入库）；C51/C52 mock 层已过。2026-10-24 T44-T46 落地 + T47 重建验证：t47_verify 40 项（披露流转 17 / 接入链路 9 / 静态判定与分批计时 9 / 权限矩阵重验 5）+ t43_verify 回归 42 项（权限全路径 17 / 记忆提取 12 / TUI 动线 13）全绿，compileall 通过。待办：真实 API ④⑤⑥ 与 TUI 动线 1-5 终验。2026-10-29 T48 启动惰性化落地：`--version` 4.1s → 0.12s、openai 装配 4.1s → 1.26s，69 项回归全绿。
